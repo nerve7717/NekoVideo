@@ -1,0 +1,39 @@
+*.iml
+.gradle/
+.kotlin/
+/local.properties
+/.idea/
+.DS_Store
+/build
+**/build/
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Local / generated logs
+*.log
+build-out*.txt
+deps.txt
+
+# Local artwork used only to generate launcher icons
+/1.jpg
+
+# Signed / unsigned APKs and Play bundles
+*.apk
+*.aab
+*.ap_
+*.dex
+app/release/
+
+# Keystores — never commit signing material
+*.jks
+*.keystore
+keystore.properties
+*.pem
+*.p12
+
+# OS / editor
+Thumbs.db
+*.swp
+*~
