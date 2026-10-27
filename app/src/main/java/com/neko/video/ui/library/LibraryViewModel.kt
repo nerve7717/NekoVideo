@@ -9,6 +9,7 @@ import com.neko.video.model.MediaFolder
 import com.neko.video.model.MediaItemInfo
 import com.neko.video.model.MediaSort
 import com.neko.video.model.MediaSortField
+import com.neko.video.settings.SettingsState
 import com.neko.video.util.MediaSearch
 import com.neko.video.util.NaturalOrder
 import com.neko.video.util.SearchMode
@@ -77,6 +78,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     private var currentFolderPath: String? = null
     private var sort: MediaSort = MediaSort.DEFAULT
     private var search: SearchState = SearchState()
+    private var navigationRestored = false
 
     private val _uiState = MutableStateFlow(LibraryUiState())
     val uiState: StateFlow<LibraryUiState> = _uiState.asStateFlow()
@@ -89,14 +91,43 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         rebuild()
-        // Sort choice is a persisted preference, so follow it like any other setting.
+        // Sort choice and last visited tab are persisted preferences, so follow them like any
+        // other setting.
         viewModelScope.launch {
             settings.settingsFlow.collect { state ->
+                var needsRebuild = false
+                if (!navigationRestored) {
+                    navigationRestored = true
+                    needsRebuild = restoreNavigation(state)
+                }
                 if (state.librarySort != sort) {
                     sort = state.librarySort
-                    rebuild()
+                    needsRebuild = true
                 }
+                if (needsRebuild) rebuild()
             }
+        }
+    }
+
+    /**
+     * Reopens the tab (and folder) the user left the library in. Called once per process, so a
+     * later settings write — which this view model triggers itself — cannot yank the user back.
+     */
+    private fun restoreNavigation(state: SettingsState): Boolean {
+        val tab = LibraryTab.entries.firstOrNull { it.name == state.libraryTab } ?: return false
+        val folderPath = state.libraryFolderPath.ifBlank { null }
+        val previousPath = currentFolderPath
+        currentFolderPath = if (tab == LibraryTab.FOLDERS) folderPath else null
+        val changed = tab != _uiState.value.tab || currentFolderPath != previousPath
+        _uiState.update { it.copy(tab = tab) }
+        return changed
+    }
+
+    private fun persistNavigation() {
+        val tab = _uiState.value.tab
+        val path = currentFolderPath.orEmpty()
+        viewModelScope.launch {
+            settings.update { it.copy(libraryTab = tab.name, libraryFolderPath = path) }
         }
     }
 
@@ -112,6 +143,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         if (tab != LibraryTab.FOLDERS) currentFolderPath = null
         _uiState.update { it.copy(tab = tab) }
         rebuild()
+        persistNavigation()
     }
 
     /** Load from memory cache if present; otherwise scan once. */
@@ -183,6 +215,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         currentFolderPath = folder.path
         _uiState.update { it.copy(tab = LibraryTab.FOLDERS) }
         rebuild()
+        persistNavigation()
     }
 
     /** Go one level up; from a top-level folder this returns to the folder grid. */
@@ -191,6 +224,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         val parent = allFolders.firstOrNull { it.path == current }?.parentPath
         currentFolderPath = parent?.takeIf { candidate -> allFolders.any { it.path == candidate } }
         rebuild()
+        persistNavigation()
     }
 
     fun setSort(next: MediaSort) {
@@ -253,6 +287,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                         it.copy(isLoading = false, tab = LibraryTab.ALL)
                     }
                     rebuild()
+                    persistNavigation()
                 }
                 .onFailure { error ->
                     _uiState.update { it.copy(isLoading = false, error = error.message) }

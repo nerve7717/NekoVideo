@@ -48,6 +48,10 @@ data class SettingsState(
     val colorStyle: String = "TonalSpot",
     val colorSpec: String = "SPEC_2025",
     val librarySort: MediaSort = MediaSort.DEFAULT,
+    /** Last visible library tab (`LibraryTab.name`), restored on the next launch. */
+    val libraryTab: String = "ALL",
+    /** Last browsed folder path; empty when the folder grid was showing. */
+    val libraryFolderPath: String = "",
 )
 
 class AppSettings(private val context: Context) {
@@ -97,6 +101,8 @@ class AppSettings(private val context: Context) {
             prefs[Keys.COLOR_SPEC] = next.colorSpec
             prefs[Keys.LIBRARY_SORT_FIELD] = next.librarySort.field.name
             prefs[Keys.LIBRARY_SORT_ASCENDING] = next.librarySort.ascending
+            prefs[Keys.LIBRARY_TAB] = next.libraryTab
+            prefs[Keys.LIBRARY_FOLDER_PATH] = next.libraryFolderPath
         }
     }
 
@@ -142,6 +148,8 @@ class AppSettings(private val context: Context) {
             }.getOrDefault(MediaSortField.NAME),
             ascending = this[Keys.LIBRARY_SORT_ASCENDING] ?: true,
         ),
+        libraryTab = this[Keys.LIBRARY_TAB] ?: "ALL",
+        libraryFolderPath = this[Keys.LIBRARY_FOLDER_PATH] ?: "",
     )
 
     private object Keys {
@@ -175,5 +183,7 @@ class AppSettings(private val context: Context) {
         val COLOR_SPEC = stringPreferencesKey("color_spec")
         val LIBRARY_SORT_FIELD = stringPreferencesKey("library_sort_field")
         val LIBRARY_SORT_ASCENDING = booleanPreferencesKey("library_sort_ascending")
+        val LIBRARY_TAB = stringPreferencesKey("library_tab")
+        val LIBRARY_FOLDER_PATH = stringPreferencesKey("library_folder_path")
     }
 }
