@@ -33,9 +33,11 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.automirrored.outlined.Sort
 import androidx.compose.material.icons.outlined.VideoFile
 import androidx.compose.runtime.Composable
@@ -76,10 +78,12 @@ import com.neko.video.ui.components.PrimaryButton
 import com.neko.video.ui.components.SecondaryButton
 import com.neko.video.ui.theme.LocalMainBottomContentPadding
 import com.neko.video.util.FormatUtils
+import com.neko.video.util.SearchMode
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.blur.layerBackdrop
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
@@ -158,6 +162,8 @@ fun LibraryScreen(
     }
     // Pill height + vertical gaps reserved so list content can scroll under the glass tabs.
     val floatingTabInset = 56.dp + 16.dp
+    // Same idea for the floating search panel: field row + mode chips + gaps.
+    val searchPanelInset = 132.dp
 
     MiuixPage(
         title = stringResource(R.string.library_title),
@@ -170,6 +176,13 @@ fun LibraryScreen(
             }
             IconButton(onClick = { viewModel.refresh(force = true) }) {
                 Icon(Icons.Outlined.Refresh, contentDescription = stringResource(R.string.library_refresh))
+            }
+            IconButton(
+                onClick = {
+                    if (state.search.active) viewModel.closeSearch() else viewModel.openSearch()
+                },
+            ) {
+                Icon(Icons.Outlined.Search, contentDescription = stringResource(R.string.library_search))
             }
             IconButton(onClick = { showSortSheet = true }) {
                 Icon(
@@ -225,6 +238,14 @@ fun LibraryScreen(
                                     )
                                 }
                             },
+                        )
+                    }
+                    state.search.active -> {
+                        SearchResults(
+                            state = state,
+                            onPlay = onPlay,
+                            nestedScrollConnection = nestedScrollConnection,
+                            topContentPadding = searchPanelInset,
                         )
                     }
                     else -> {
@@ -321,17 +342,31 @@ fun LibraryScreen(
                 }
             }
 
-            GlassFloatingTabRow(
-                tabs = tabs,
-                selectedTabIndex = state.tab.ordinal,
-                onTabSelected = { index ->
-                    viewModel.selectTab(LibraryTab.entries[index])
-                },
-                backdrop = tabGlassBackdrop,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 8.dp),
-            )
+            if (state.search.active) {
+                LibrarySearchPanel(
+                    state = state.search,
+                    hasFolder = state.currentFolder != null,
+                    onQueryChange = viewModel::setSearchQuery,
+                    onModeChange = viewModel::setSearchMode,
+                    onScopeChange = viewModel::setSearchScope,
+                    onClose = viewModel::closeSearch,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 8.dp),
+                )
+            } else {
+                GlassFloatingTabRow(
+                    tabs = tabs,
+                    selectedTabIndex = state.tab.ordinal,
+                    onTabSelected = { index ->
+                        viewModel.selectTab(LibraryTab.entries[index])
+                    },
+                    backdrop = tabGlassBackdrop,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 8.dp),
+                )
+            }
         }
     }
 
@@ -676,5 +711,126 @@ private fun MediaSort.labelRes(): Int = when (field) {
         R.string.library_sort_duration_asc
     } else {
         R.string.library_sort_duration_desc
+    }
+}
+
+/**
+ * Search box + mode/scope switches. Floats above the results the same way the glass tab row
+ * floats above the normal lists, so it needs an opaque card to keep text readable.
+ */
+@Composable
+private fun LibrarySearchPanel(
+    state: SearchState,
+    hasFolder: Boolean,
+    onQueryChange: (String) -> Unit,
+    onModeChange: (SearchMode) -> Unit,
+    onScopeChange: (SearchScope) -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 12.dp, end = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextField(
+                    value = state.query,
+                    onValueChange = onQueryChange,
+                    label = stringResource(R.string.library_search_hint),
+                    modifier = Modifier.weight(1f),
+                )
+                IconButton(onClick = onClose) {
+                    Icon(
+                        Icons.Outlined.Close,
+                        contentDescription = stringResource(R.string.library_search_close),
+                    )
+                }
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SearchChip(
+                label = stringResource(R.string.library_search_mode_fuzzy),
+                selected = state.mode == SearchMode.FUZZY,
+                onClick = { onModeChange(SearchMode.FUZZY) },
+            )
+            SearchChip(
+                label = stringResource(R.string.library_search_mode_exact),
+                selected = state.mode == SearchMode.EXACT,
+                onClick = { onModeChange(SearchMode.EXACT) },
+            )
+            Spacer(modifier = Modifier.weight(1f))
+            if (hasFolder) {
+                SearchChip(
+                    label = stringResource(R.string.library_search_scope_all),
+                    selected = state.scope == SearchScope.ALL,
+                    onClick = { onScopeChange(SearchScope.ALL) },
+                )
+                SearchChip(
+                    label = stringResource(R.string.library_search_scope_folder),
+                    selected = state.scope == SearchScope.CURRENT_FOLDER,
+                    onClick = { onScopeChange(SearchScope.CURRENT_FOLDER) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Card(onClick = onClick) {
+        Text(
+            text = label,
+            style = MiuixTheme.textStyles.body2,
+            color = if (selected) {
+                MiuixTheme.colorScheme.primary
+            } else {
+                MiuixTheme.colorScheme.onSurfaceVariantSummary
+            },
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+        )
+    }
+}
+
+/** Search results reuse [VideoList], so tapping a hit plays it with the results as playlist. */
+@Composable
+private fun SearchResults(
+    state: LibraryUiState,
+    onPlay: (MediaItemInfo) -> Unit,
+    nestedScrollConnection: NestedScrollConnection,
+    topContentPadding: Dp,
+) {
+    when {
+        state.search.query.isBlank() -> EmptyState(
+            title = stringResource(R.string.library_search_idle_title),
+            message = stringResource(R.string.library_search_idle_hint),
+            icon = Icons.Outlined.Search,
+        )
+        state.searchResults.isEmpty() -> EmptyState(
+            title = stringResource(R.string.library_search_no_result),
+            message = stringResource(R.string.library_search_no_result_hint),
+            icon = Icons.Outlined.Search,
+        )
+        else -> VideoList(
+            items = state.searchResults,
+            onPlay = onPlay,
+            nestedScrollConnection = nestedScrollConnection,
+            topContentPadding = topContentPadding,
+        )
     }
 }

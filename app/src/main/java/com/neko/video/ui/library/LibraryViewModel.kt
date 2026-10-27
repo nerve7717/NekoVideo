@@ -9,7 +9,10 @@ import com.neko.video.model.MediaFolder
 import com.neko.video.model.MediaItemInfo
 import com.neko.video.model.MediaSort
 import com.neko.video.model.MediaSortField
+import com.neko.video.util.MediaSearch
 import com.neko.video.util.NaturalOrder
+import com.neko.video.util.SearchMode
+import com.neko.video.util.isUnderDirectory
 import com.neko.video.util.parentDirectoryOf
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,6 +24,23 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 enum class LibraryTab { RECENT, FOLDERS, ALL }
+
+/** Which videos the search box looks at. */
+enum class SearchScope {
+    /** Every scanned video, wherever it lives. */
+    ALL,
+
+    /** Only videos inside the folder currently being browsed. */
+    CURRENT_FOLDER,
+}
+
+/** State of the library search. Matching itself lives in `util/MediaSearch`. */
+data class SearchState(
+    val active: Boolean = false,
+    val query: String = "",
+    val mode: SearchMode = SearchMode.FUZZY,
+    val scope: SearchScope = SearchScope.ALL,
+)
 
 data class LibraryUiState(
     val tab: LibraryTab = LibraryTab.ALL,
@@ -35,6 +55,10 @@ data class LibraryUiState(
     /** Videos stored directly in [currentFolder], already sorted. */
     val folderVideos: List<MediaItemInfo> = emptyList(),
     val sort: MediaSort = MediaSort.DEFAULT,
+    /** Search box state; while [SearchState.active] the screen shows [searchResults]. */
+    val search: SearchState = SearchState(),
+    /** Videos matching the current query, already sorted like every other list. */
+    val searchResults: List<MediaItemInfo> = emptyList(),
     val error: String? = null,
     val hasPermission: Boolean = false,
 )
@@ -52,6 +76,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     private var allFolders: List<MediaFolder> = LocalMediaCache.folders.orEmpty()
     private var currentFolderPath: String? = null
     private var sort: MediaSort = MediaSort.DEFAULT
+    private var search: SearchState = SearchState()
 
     private val _uiState = MutableStateFlow(LibraryUiState())
     val uiState: StateFlow<LibraryUiState> = _uiState.asStateFlow()
@@ -152,6 +177,40 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Enter search mode; inside a folder the default scope is that folder. */
+    fun openSearch() {
+        search = SearchState(
+            active = true,
+            scope = if (currentFolderPath != null) SearchScope.CURRENT_FOLDER else SearchScope.ALL,
+        )
+        rebuild()
+    }
+
+    /** Leave search mode and restore the previous view (folder position and sort stay). */
+    fun closeSearch() {
+        if (!search.active) return
+        search = SearchState()
+        rebuild()
+    }
+
+    fun setSearchQuery(query: String) {
+        if (search.query == query) return
+        search = search.copy(query = query)
+        rebuild()
+    }
+
+    fun setSearchMode(mode: SearchMode) {
+        if (search.mode == mode) return
+        search = search.copy(mode = mode)
+        rebuild()
+    }
+
+    fun setSearchScope(scope: SearchScope) {
+        if (search.scope == scope) return
+        search = search.copy(scope = scope)
+        rebuild()
+    }
+
     fun importTree(uri: Uri) {
         importJob?.cancel()
         importJob = viewModelScope.launch {
@@ -199,6 +258,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         }
         val path = currentFolderPath
         val folder = path?.let { current -> allFolders.firstOrNull { it.path == current } }
+        val searchState = search
 
         _uiState.update {
             it.copy(
@@ -218,9 +278,32 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                     )
                 },
                 sort = sort,
+                search = searchState,
+                searchResults = if (searchState.active) {
+                    computeSearchResults(searchState, path)
+                } else {
+                    emptyList()
+                },
                 error = error,
             )
         }
+    }
+
+    /**
+     * In-memory filter over the already scanned library: no Room / MediaStore round trip, and the
+     * result keeps the user's current sort because it goes through [sortedVideos].
+     */
+    private fun computeSearchResults(state: SearchState, path: String?): List<MediaItemInfo> {
+        if (state.query.isBlank()) return emptyList()
+        val pool = when (state.scope) {
+            SearchScope.ALL -> allVideos
+            SearchScope.CURRENT_FOLDER -> path?.let { dir ->
+                allVideos.filter { item -> item.path?.let { isUnderDirectory(it, dir) } == true }
+            } ?: allVideos
+        }
+        return sortedVideos(
+            pool.filter { item -> MediaSearch.matches(item, state.query, state.mode) },
+        )
     }
 
     private fun sortedVideos(items: List<MediaItemInfo>): List<MediaItemInfo> {

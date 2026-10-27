@@ -32,6 +32,17 @@
     <string name="library_sort_duration_asc">Duration (shortest first)</string>
     <string name="library_folder_up">Up one level</string>
     <string name="library_folder_empty_hint">No videos in this folder — try going up one level</string>
+    <string name="library_search">Search</string>
+    <string name="library_search_hint">Search video names</string>
+    <string name="library_search_close">Close search</string>
+    <string name="library_search_mode_fuzzy">Fuzzy</string>
+    <string name="library_search_mode_exact">Exact</string>
+    <string name="library_search_scope_all">All videos</string>
+    <string name="library_search_scope_folder">This folder</string>
+    <string name="library_search_idle_title">Search videos</string>
+    <string name="library_search_idle_hint">Type a keyword to search, in fuzzy or exact mode</string>
+    <string name="library_search_no_result">No matching videos</string>
+    <string name="library_search_no_result_hint">Try another keyword, or switch to fuzzy search</string>
 
     <string name="network_title">Network</string>
     <string name="network_webdav">WebDAV</string>
