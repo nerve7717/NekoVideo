@@ -37,6 +37,9 @@ The bottom bar has five tabs:
   descend into sub-folders and videos
 - Sorting by name (natural order), date modified, size, or duration, ascending or
   descending; the choice is remembered
+- Search the library: fuzzy (query words must appear in order, gaps allowed) or exact
+  (each word must be a contiguous substring), over all videos or just the current folder;
+  results keep the current sort
 - Pull-to-refresh; scan and import jobs cancel if you start another one
 
 ### Network sources
