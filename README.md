@@ -33,6 +33,10 @@ The bottom bar has five tabs:
 - Tabs: recently played / folders / all
 - Pick a single file or a whole folder from the system picker
 - Folder import walks the tree, not only the top level
+- Folders are browsed as a tree: the first screen lists top-level folders only, then you
+  descend into sub-folders and videos
+- Sorting by name (natural order), date modified, size, or duration, ascending or
+  descending; the choice is remembered
 - Pull-to-refresh; scan and import jobs cancel if you start another one
 
 ### Network sources
