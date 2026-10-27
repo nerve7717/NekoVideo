@@ -2,6 +2,7 @@ package com.neko.video.network.source
 
 import android.content.ContentUris
 import android.content.Context
+import android.database.Cursor
 import android.net.Uri
 import android.provider.MediaStore
 import android.provider.DocumentsContract
@@ -10,6 +11,7 @@ import com.neko.video.model.MediaItemInfo
 import com.neko.video.model.SourceType
 import com.neko.video.model.SubtitleCandidate
 import com.neko.video.util.FormatUtils
+import com.neko.video.util.MediaIndex
 import com.neko.video.util.commonAncestorDirectory
 import com.neko.video.util.directoryNameOf
 import com.neko.video.util.isStorageVolumeRoot
@@ -19,6 +21,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 
+/** Outcome of an incremental scan: the merged library plus what the index should persist. */
+data class LocalSyncResult(
+    val videos: List<MediaItemInfo>,
+    /** Rows whose stored copy is missing or outdated. */
+    val upserts: List<MediaItemInfo>,
+    /** MediaStore ids that no longer exist and must be dropped from the index. */
+    val removedIds: List<String>,
+)
+
 class LocalSourceProvider(
     private val context: Context,
 ) : MediaSourceProvider {
@@ -26,58 +37,112 @@ class LocalSourceProvider(
 
     override suspend fun list(path: String): List<MediaItemInfo> = loadAllVideos()
 
-    suspend fun loadAllVideos(): List<MediaItemInfo> = withContext(Dispatchers.IO) {
-        val result = mutableListOf<MediaItemInfo>()
-        val collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
-        val projection = arrayOf(
-            MediaStore.Video.Media._ID,
-            MediaStore.Video.Media.DISPLAY_NAME,
-            MediaStore.Video.Media.SIZE,
-            MediaStore.Video.Media.DURATION,
-            MediaStore.Video.Media.WIDTH,
-            MediaStore.Video.Media.HEIGHT,
-            MediaStore.Video.Media.DATE_MODIFIED,
-            MediaStore.Video.Media.MIME_TYPE,
-            MediaStore.Video.Media.DATA,
-            MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
-            MediaStore.Video.Media.BUCKET_ID,
-        )
-        val sortOrder = "${MediaStore.Video.Media.DATE_MODIFIED} DESC"
-        context.contentResolver.query(collection, projection, null, null, sortOrder)?.use { cursor ->
-            val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
-            val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
-            val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
-            val durationCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
-            val widthCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.WIDTH)
-            val heightCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.HEIGHT)
-            val modifiedCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_MODIFIED)
-            val mimeCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.MIME_TYPE)
-            val dataCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATA)
+    suspend fun loadAllVideos(): List<MediaItemInfo> =
+        withContext(Dispatchers.IO) { queryRows(null, VIDEO_PROJECTION_ORDER) }
 
+    /**
+     * Looks at `MediaStore` only to find out what changed: one cheap `_id`/`date_modified` pass,
+     * then full rows for the new or modified ids only. SAF imports are carried over untouched —
+     * they are not in `MediaStore`, so comparing them would delete them on every launch.
+     *
+     * @param knownVideos what the persisted index currently holds.
+     * @param force re-read every row, e.g. when the user pulls to refresh.
+     */
+    suspend fun sync(knownVideos: List<MediaItemInfo>, force: Boolean = false): LocalSyncResult =
+        withContext(Dispatchers.IO) {
+            val currentStamps = queryStamps()
+            val knownStamps = knownVideos
+                .filter { MediaIndex.isMediaStoreEntry(it.id) }
+                .associate { it.id to it.modifiedTime }
+            val changed = MediaIndex.changedIds(
+                current = currentStamps,
+                known = knownStamps,
+                force = force || knownStamps.isEmpty(),
+            )
+            val removed = MediaIndex.removedIds(currentStamps.keys, knownStamps.keys)
+            val upserts = if (changed.isEmpty()) emptyList() else queryRows(changed, null)
+            val untouched = knownVideos.filterNot { it.id in changed || it.id in removed }
+            LocalSyncResult(
+                videos = untouched + upserts,
+                upserts = upserts,
+                removedIds = removed.toList(),
+            )
+        }
+
+    /** `id → modified time` for every video MediaStore knows about. Two columns only, so it is cheap. */
+    private fun queryStamps(): Map<String, Long> {
+        val stamps = LinkedHashMap<String, Long>()
+        context.contentResolver.query(
+            videoCollection(),
+            arrayOf(MediaStore.Video.Media._ID, MediaStore.Video.Media.DATE_MODIFIED),
+            null,
+            null,
+            null,
+        )?.use { cursor ->
             while (cursor.moveToNext()) {
-                val id = cursor.getLong(idCol)
-                val contentUri = ContentUris.withAppendedId(collection, id)
-                val path = cursor.getString(dataCol)
-                val name = cursor.getString(nameCol) ?: "video_$id"
-                result += MediaItemInfo(
-                    id = "local_$id",
-                    name = name,
-                    uri = contentUri.toString(),
-                    path = path,
-                    sourceType = SourceType.LOCAL,
-                    size = cursor.getLong(sizeCol),
-                    modifiedTime = cursor.getLong(modifiedCol) * 1000L,
-                    mimeType = cursor.getString(mimeCol),
-                    duration = cursor.getLong(durationCol),
-                    width = cursor.getInt(widthCol),
-                    height = cursor.getInt(heightCol),
-                    thumbnailUri = contentUri.toString(),
-                    subtitleCandidates = findSiblingSubtitles(path, name),
-                )
+                val id = cursor.getLong(0)
+                stamps["${MediaIndex.MEDIA_STORE_ID_PREFIX}$id"] = cursor.getLong(1) * 1000L
             }
         }
-        result
+        return stamps
     }
+
+    /** Full rows for [ids] (`local_<mediaId>`), queried in chunks to stay under SQLite's limit. */
+    private fun queryRows(ids: Set<String>?, sortOrder: String?): List<MediaItemInfo> {
+        val numericIds = ids?.mapNotNull {
+            it.removePrefix(MediaIndex.MEDIA_STORE_ID_PREFIX).toLongOrNull()
+        }
+        if (numericIds != null && numericIds.isEmpty()) return emptyList()
+        val subtitleCache = SubtitleDirCache()
+        val result = ArrayList<MediaItemInfo>(numericIds?.size ?: 512)
+        val selection = numericIds?.chunked(ID_CHUNK_SIZE)?.map { chunk ->
+            "${MediaStore.Video.Media._ID} IN (${chunk.joinToString(",")})"
+        }
+        // A null selection list means "everything", which is the first-launch / forced rescan path.
+        (selection ?: listOf(null)).forEach { chunkSelection ->
+            context.contentResolver.query(
+                videoCollection(),
+                VIDEO_PROJECTION,
+                chunkSelection,
+                null,
+                sortOrder,
+            )?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    result += readRow(cursor, subtitleCache)
+                }
+            }
+        }
+        return result
+    }
+
+    /**
+     * Column order matches [VIDEO_PROJECTION]; reading by index keeps the loop free of repeated
+     * `getColumnIndexOrThrow` lookups, which dominated the scan on large libraries.
+     */
+    private fun readRow(cursor: Cursor, subtitleCache: SubtitleDirCache): MediaItemInfo {
+        val mediaId = cursor.getLong(COLUMN_ID)
+        val path = cursor.getString(COLUMN_PATH)
+        val name = cursor.getString(COLUMN_NAME) ?: "video_$mediaId"
+        val contentUri = ContentUris.withAppendedId(videoCollection(), mediaId)
+        return MediaItemInfo(
+            id = "${MediaIndex.MEDIA_STORE_ID_PREFIX}$mediaId",
+            name = name,
+            uri = contentUri.toString(),
+            path = path,
+            sourceType = SourceType.LOCAL,
+            size = cursor.getLong(COLUMN_SIZE),
+            modifiedTime = cursor.getLong(COLUMN_MODIFIED) * 1000L,
+            mimeType = cursor.getString(COLUMN_MIME),
+            duration = cursor.getLong(COLUMN_DURATION),
+            width = cursor.getInt(COLUMN_WIDTH),
+            height = cursor.getInt(COLUMN_HEIGHT),
+            thumbnailUri = contentUri.toString(),
+            subtitleCandidates = subtitleCache.candidatesFor(path),
+        )
+    }
+
+    private fun videoCollection(): Uri =
+        MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
 
     /**
      * Builds the browsable folder tree for [videos].
@@ -219,19 +284,62 @@ class LocalSourceProvider(
             ?: runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
     }
 
-    private fun findSiblingSubtitles(path: String?, videoName: String): List<SubtitleCandidate> {
-        if (path.isNullOrBlank()) return emptyList()
-        val videoFile = File(path)
-        val parent = videoFile.parentFile ?: return emptyList()
-        val base = videoFile.nameWithoutExtension
-        return parent.listFiles()
-            ?.filter { FormatUtils.isSubtitleFile(it.name) && it.name.startsWith(base, ignoreCase = true) }
-            ?.map {
-                SubtitleCandidate(
-                    name = it.name,
-                    uri = Uri.fromFile(it).toString(),
-                )
+    /**
+     * Lists each directory once and answers subtitle lookups from memory. Scanning used to call
+     * `listFiles()` per video, which is what made the first launch slow on large libraries.
+     */
+    private class SubtitleDirCache {
+        private val filesByDir = HashMap<String, List<File>>()
+
+        fun candidatesFor(videoPath: String?): List<SubtitleCandidate> {
+            if (videoPath.isNullOrBlank()) return emptyList()
+            val videoFile = File(videoPath)
+            val parent = videoFile.parentFile ?: return emptyList()
+            val files = filesByDir.getOrPut(parent.absolutePath) {
+                parent.listFiles()?.toList().orEmpty()
             }
-            .orEmpty()
+            if (files.isEmpty()) return emptyList()
+            val base = videoFile.nameWithoutExtension
+            return files.asSequence()
+                .filter { file ->
+                    FormatUtils.isSubtitleFile(file.name) &&
+                        file.name.startsWith(base, ignoreCase = true)
+                }
+                .map { file ->
+                    SubtitleCandidate(
+                        name = file.name,
+                        uri = Uri.fromFile(file).toString(),
+                    )
+                }
+                .toList()
+        }
+    }
+
+    private companion object {
+        const val ID_CHUNK_SIZE = 400
+
+        /** Must stay in sync with the [COLUMN_*] indexes below. */
+        val VIDEO_PROJECTION = arrayOf(
+            MediaStore.Video.Media._ID,
+            MediaStore.Video.Media.DISPLAY_NAME,
+            MediaStore.Video.Media.SIZE,
+            MediaStore.Video.Media.DURATION,
+            MediaStore.Video.Media.WIDTH,
+            MediaStore.Video.Media.HEIGHT,
+            MediaStore.Video.Media.DATE_MODIFIED,
+            MediaStore.Video.Media.MIME_TYPE,
+            MediaStore.Video.Media.DATA,
+        )
+        const val VIDEO_PROJECTION_ORDER = "${MediaStore.Video.Media.DATE_MODIFIED} DESC"
+
+        const val COLUMN_ID = 0
+        const val COLUMN_NAME = 1
+        const val COLUMN_SIZE = 2
+        const val COLUMN_DURATION = 3
+        const val COLUMN_WIDTH = 4
+        const val COLUMN_HEIGHT = 5
+        const val COLUMN_MODIFIED = 6
+        const val COLUMN_MIME = 7
+        const val COLUMN_PATH = 8
     }
 }

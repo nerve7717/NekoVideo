@@ -4,9 +4,12 @@ import android.content.Context
 import android.net.Uri
 import com.neko.video.database.AppDatabase
 import com.neko.video.database.FavoriteEntity
+import com.neko.video.database.MediaIndexDatabase
 import com.neko.video.database.PlaybackHistoryEntity
 import com.neko.video.database.RecentUrlEntity
 import com.neko.video.database.WebDavServerEntity
+import com.neko.video.database.toIndexedEntity
+import com.neko.video.database.toMediaItem as indexedToMediaItem
 import com.neko.video.model.MediaFolder
 import com.neko.video.model.MediaItemInfo
 import com.neko.video.model.SourceType
@@ -20,18 +23,28 @@ import com.neko.video.remote.RemoteProtocol
 import com.neko.video.remote.RemoteServerConfig
 import com.neko.video.webdav.WebDavClient
 import com.neko.video.webdav.WebDavServerConfig
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.util.UUID
+
+/** Result of an incremental library sync: the merged library plus whether anything actually moved. */
+data class LocalSyncOutcome(
+    val videos: List<MediaItemInfo>,
+    val changed: Boolean,
+)
 
 class MediaRepository(
     context: Context,
     private val database: AppDatabase = AppDatabase.get(context),
     private val secureStorage: SecureStorage = SecureStorage.get(context),
+    private val mediaIndex: MediaIndexDatabase = MediaIndexDatabase.get(context),
 ) {
     private val localSource = LocalSourceProvider(context)
+    private val indexDao = mediaIndex.indexedMediaDao()
     private val httpSource = HttpSourceProvider()
     private fun webDavClient(timeoutSeconds: Int = 20) = WebDavClient(timeoutSeconds)
 
@@ -73,6 +86,41 @@ class MediaRepository(
 
     suspend fun loadFromTreeUri(uri: Uri): List<MediaItemInfo> =
         localSource.loadFromTreeUri(uri)
+
+    /** Local videos as remembered by the persisted index; empty until the first scan finishes. */
+    suspend fun indexedLocalVideos(): List<MediaItemInfo> = withContext(Dispatchers.IO) {
+        indexDao.getAll().map { it.indexedToMediaItem() }
+    }
+
+    /** Writes rows that were imported outside MediaStore (SAF folder import) into the index. */
+    suspend fun cacheLocalVideos(items: List<MediaItemInfo>) = withContext(Dispatchers.IO) {
+        if (items.isNotEmpty()) indexDao.upsertAll(items.map { it.toIndexedEntity() })
+    }
+
+    /**
+     * Compares [known] against MediaStore, re-reads only what moved and persists the result.
+     *
+     * [LocalSyncOutcome.changed] is false when nothing moved, which lets callers skip rebuilding
+     * the folder tree and re-emitting the lists on a warm start.
+     */
+    suspend fun syncLocalVideos(
+        known: List<MediaItemInfo>,
+        force: Boolean = false,
+    ): LocalSyncOutcome {
+        val result = localSource.sync(known, force)
+        withContext(Dispatchers.IO) {
+            if (result.upserts.isNotEmpty()) {
+                indexDao.upsertAll(result.upserts.map { it.toIndexedEntity() })
+            }
+            if (result.removedIds.isNotEmpty()) {
+                indexDao.deleteByIds(result.removedIds)
+            }
+        }
+        return LocalSyncOutcome(
+            videos = result.videos,
+            changed = result.upserts.isNotEmpty() || result.removedIds.isNotEmpty(),
+        )
+    }
 
     fun createHttpMedia(
         url: String,

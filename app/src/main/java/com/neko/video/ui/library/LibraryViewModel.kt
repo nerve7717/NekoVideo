@@ -125,7 +125,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
             rebuild()
             return
         }
-        refresh(force = true)
+        refresh(force = false)
     }
 
     fun refresh(force: Boolean = true) {
@@ -133,17 +133,33 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
             ensureLoaded()
             return
         }
+        scan(force = force)
+    }
+
+    /**
+     * Two phases on purpose. The persisted index is applied first, so a warm start shows the
+     * library without waiting for MediaStore; only then is the index diffed against MediaStore and
+     * just the new / modified / deleted rows are touched. A cold start (empty index) keeps the
+     * spinner up and falls back to a full scan.
+     */
+    private fun scan(force: Boolean) {
         scanJob?.cancel()
         scanJob = viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true, error = null) }
-            runCatching { repository.loadLocalVideos() }
-                .onSuccess { videos ->
-                    val folders = repository.loadLocalFolders(videos)
-                    LocalMediaCache.update(videos, folders)
-                    allVideos = videos
-                    allFolders = folders
-                    _uiState.update { it.copy(isLoading = false) }
-                    rebuild()
+            runCatching {
+                val indexed = repository.indexedLocalVideos()
+                if (indexed.isNotEmpty()) {
+                    applyVideos(indexed, loading = false)
+                }
+                repository.syncLocalVideos(indexed, force = force) to indexed.isEmpty()
+            }
+                .onSuccess { (outcome, coldStart) ->
+                    // Nothing moved since the last scan: keep the lists already on screen.
+                    if (coldStart || outcome.changed) {
+                        applyVideos(outcome.videos, loading = false)
+                    } else {
+                        _uiState.update { it.copy(isLoading = false) }
+                    }
                 }
                 .onFailure { error ->
                     _uiState.update {
@@ -151,6 +167,15 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                     }
                 }
         }
+    }
+
+    private suspend fun applyVideos(videos: List<MediaItemInfo>, loading: Boolean) {
+        val folders = repository.loadLocalFolders(videos)
+        LocalMediaCache.update(videos, folders)
+        allVideos = videos
+        allFolders = folders
+        _uiState.update { it.copy(isLoading = loading) }
+        rebuild()
     }
 
     /** Enter a folder: its sub-folders and its own videos replace the flat list. */
@@ -217,6 +242,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
             _uiState.update { it.copy(isLoading = true, error = null) }
             runCatching { repository.loadFromTreeUri(uri) }
                 .onSuccess { imported ->
+                    repository.cacheLocalVideos(imported)
                     val merged = (allVideos + imported).distinctBy { it.uri }
                     val folders = repository.loadLocalFolders(merged)
                     LocalMediaCache.update(merged, folders)
