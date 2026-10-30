@@ -118,7 +118,8 @@ fun LibraryScreen(
                     android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
                 )
             }
-            onPlay(viewModel.mediaFromPickedUri(uri, null))
+            // Kept in the library as well as played, so it is not only visible in "recently played".
+            onPlay(viewModel.importPickedVideo(uri, null))
         }
     }
 
@@ -233,6 +234,10 @@ fun LibraryScreen(
                                         },
                                     )
                                     SecondaryButton(
+                                        text = stringResource(R.string.library_pick_folder),
+                                        onClick = { pickFolderLauncher.launch(null) },
+                                    )
+                                    SecondaryButton(
                                         text = stringResource(R.string.library_pick_video),
                                         onClick = { pickVideoLauncher.launch(arrayOf("video/*")) },
                                     )
@@ -319,12 +324,18 @@ fun LibraryScreen(
                                             title = stringResource(R.string.library_empty),
                                             message = stringResource(R.string.library_empty_hint),
                                             action = {
-                                                PrimaryButton(
-                                                    text = stringResource(R.string.library_pick_video),
-                                                    onClick = {
-                                                        pickVideoLauncher.launch(arrayOf("video/*"))
-                                                    },
-                                                )
+                                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                    PrimaryButton(
+                                                        text = stringResource(R.string.library_pick_folder),
+                                                        onClick = { pickFolderLauncher.launch(null) },
+                                                    )
+                                                    SecondaryButton(
+                                                        text = stringResource(R.string.library_pick_video),
+                                                        onClick = {
+                                                            pickVideoLauncher.launch(arrayOf("video/*"))
+                                                        },
+                                                    )
+                                                }
                                             },
                                         )
                                     } else {

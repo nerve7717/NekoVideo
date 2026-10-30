@@ -52,6 +52,12 @@ data class SettingsState(
     val libraryTab: String = "ALL",
     /** Last browsed folder path; empty when the folder grid was showing. */
     val libraryFolderPath: String = "",
+    /**
+     * SAF trees the user added by hand. They are re-walked on every scan: folders added this way
+     * do not always appear in MediaStore, so relying on the media index alone would hide new
+     * files until the system got around to indexing them.
+     */
+    val librarySafTrees: List<String> = emptyList(),
 )
 
 class AppSettings(private val context: Context) {
@@ -103,6 +109,7 @@ class AppSettings(private val context: Context) {
             prefs[Keys.LIBRARY_SORT_ASCENDING] = next.librarySort.ascending
             prefs[Keys.LIBRARY_TAB] = next.libraryTab
             prefs[Keys.LIBRARY_FOLDER_PATH] = next.libraryFolderPath
+            prefs[Keys.LIBRARY_SAF_TREES] = next.librarySafTrees.joinToString(TREE_SEPARATOR)
         }
     }
 
@@ -150,6 +157,9 @@ class AppSettings(private val context: Context) {
         ),
         libraryTab = this[Keys.LIBRARY_TAB] ?: "ALL",
         libraryFolderPath = this[Keys.LIBRARY_FOLDER_PATH] ?: "",
+        librarySafTrees = (this[Keys.LIBRARY_SAF_TREES] ?: "")
+            .split(TREE_SEPARATOR)
+            .filter { it.isNotBlank() },
     )
 
     private object Keys {
@@ -185,5 +195,11 @@ class AppSettings(private val context: Context) {
         val LIBRARY_SORT_ASCENDING = booleanPreferencesKey("library_sort_ascending")
         val LIBRARY_TAB = stringPreferencesKey("library_tab")
         val LIBRARY_FOLDER_PATH = stringPreferencesKey("library_folder_path")
+        val LIBRARY_SAF_TREES = stringPreferencesKey("library_saf_trees")
+    }
+
+    private companion object {
+        /** Tree URIs contain no newlines, so they double as the list separator. */
+        const val TREE_SEPARATOR = "\n"
     }
 }

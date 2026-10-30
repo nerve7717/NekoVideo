@@ -1,7 +1,13 @@
 package com.neko.video.ui.library
 
 import android.app.Application
+import android.database.ContentObserver
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.provider.DocumentsContract
+import android.provider.MediaStore
+import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.neko.video.asNekoVideoApp
@@ -9,17 +15,21 @@ import com.neko.video.model.MediaFolder
 import com.neko.video.model.MediaItemInfo
 import com.neko.video.model.MediaSort
 import com.neko.video.model.MediaSortField
+import com.neko.video.model.SourceType
 import com.neko.video.settings.SettingsState
+import com.neko.video.util.MediaIndex
 import com.neko.video.util.MediaSearch
 import com.neko.video.util.NaturalOrder
 import com.neko.video.util.SearchMode
 import com.neko.video.util.isUnderDirectory
 import com.neko.video.util.parentDirectoryOf
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -83,6 +93,18 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     private val _uiState = MutableStateFlow(LibraryUiState())
     val uiState: StateFlow<LibraryUiState> = _uiState.asStateFlow()
 
+    private val contentResolver = application.contentResolver
+    private var observerJob: Job? = null
+
+    /**
+     * MediaStore tells nobody when it indexes a new file, and freshly copied folders can take hours
+     * to appear — which is why a new folder looked invisible until the next day. Watching the video
+     * table lets a cheap incremental scan run as soon as the system catches up.
+     */
+    private val mediaObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        override fun onChange(selfChange: Boolean, uri: Uri?) = onMediaStoreChanged()
+    }
+
     val recent = repository.recentHistoryFlow.stateIn(
         viewModelScope,
         SharingStarted.WhileSubscribed(5_000),
@@ -91,6 +113,14 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         rebuild()
+        // Registered once per process; unregistered in onCleared.
+        runCatching {
+            contentResolver.registerContentObserver(
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL),
+                true,
+                mediaObserver,
+            )
+        }
         // Sort choice and last visited tab are persisted preferences, so follow them like any
         // other setting.
         viewModelScope.launch {
@@ -129,6 +159,23 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             settings.update { it.copy(libraryTab = tab.name, libraryFolderPath = path) }
         }
+    }
+
+    /** Debounced reaction to a MediaStore change; the scan itself stays incremental. */
+    private fun onMediaStoreChanged() {
+        if (!_uiState.value.hasPermission) return
+        if (LocalMediaCache.videos == null) return
+        observerJob?.cancel()
+        observerJob = viewModelScope.launch {
+            delay(MEDIA_OBSERVER_DEBOUNCE_MS)
+            scan(force = false)
+        }
+    }
+
+    override fun onCleared() {
+        observerJob?.cancel()
+        runCatching { contentResolver.unregisterContentObserver(mediaObserver) }
+        super.onCleared()
     }
 
     fun setPermissionGranted(granted: Boolean) {
@@ -171,8 +218,9 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     /**
      * Two phases on purpose. The persisted index is applied first, so a warm start shows the
      * library without waiting for MediaStore; only then is the index diffed against MediaStore and
-     * just the new / modified / deleted rows are touched. A cold start (empty index) keeps the
-     * spinner up and falls back to a full scan.
+     * just the new / modified / deleted rows are touched. Hand-added SAF folders are re-walked
+     * here too, because MediaStore is not authoritative for them. A cold start (empty index) keeps
+     * the spinner up and falls back to a full scan.
      */
     private fun scan(force: Boolean) {
         scanJob?.cancel()
@@ -183,12 +231,21 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                 if (indexed.isNotEmpty()) {
                     applyVideos(indexed, loading = false)
                 }
-                repository.syncLocalVideos(indexed, force = force) to indexed.isEmpty()
+                val outcome = repository.syncLocalVideos(indexed, force = force)
+                val saf = walkSafTrees()
+                val previousSafIds = indexed.filter { MediaIndex.isSafEntry(it.id) }
+                    .map { it.id }
+                    .sorted()
+                if (saf.isNotEmpty()) repository.cacheLocalVideos(saf)
+                val changed = outcome.changed ||
+                    saf.map { it.id }.sorted() != previousSafIds ||
+                    LocalMediaCache.videos == null
+                mergeSaf(outcome.videos, saf) to changed
             }
-                .onSuccess { (outcome, coldStart) ->
+                .onSuccess { (videos, changed) ->
                     // Nothing moved since the last scan: keep the lists already on screen.
-                    if (coldStart || outcome.changed) {
-                        applyVideos(outcome.videos, loading = false)
+                    if (changed) {
+                        applyVideos(videos, loading = false)
                     } else {
                         _uiState.update { it.copy(isLoading = false) }
                     }
@@ -277,6 +334,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
             runCatching { repository.loadFromTreeUri(uri) }
                 .onSuccess { imported ->
                     repository.cacheLocalVideos(imported)
+                    rememberSafTree(uri)
                     val merged = (allVideos + imported).distinctBy { it.uri }
                     val folders = repository.loadLocalFolders(merged)
                     LocalMediaCache.update(merged, folders)
@@ -284,7 +342,9 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                     allFolders = folders
                     currentFolderPath = null
                     _uiState.update {
-                        it.copy(isLoading = false, tab = LibraryTab.ALL)
+                        // Land on the folder grid: that is where the folder the user just added
+                        // shows up, and MediaStore indexes it far later (if at all).
+                        it.copy(isLoading = false, tab = LibraryTab.FOLDERS)
                     }
                     rebuild()
                     persistNavigation()
@@ -295,15 +355,96 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Adds a folder to the library and remembers it, so later launches re-walk it. */
+    private suspend fun rememberSafTree(uri: Uri) {
+        val value = uri.toString()
+        settings.update { state ->
+            if (value in state.librarySafTrees) {
+                state
+            } else {
+                state.copy(librarySafTrees = state.librarySafTrees + value)
+            }
+        }
+    }
+
+    /**
+     * Re-walks every hand-added SAF folder. This is the fallback for files MediaStore has not
+     * indexed yet: the picker permission is persisted, so the folder can be read directly.
+     */
+    private suspend fun walkSafTrees(): List<MediaItemInfo> {
+        val trees = runCatching { settings.settingsFlow.first().librarySafTrees }
+            .getOrDefault(emptyList())
+        if (trees.isEmpty()) return emptyList()
+        val found = mutableListOf<MediaItemInfo>()
+        trees.forEach { tree ->
+            runCatching { repository.loadFromTreeUri(Uri.parse(tree)) }
+                .onSuccess { found += it }
+        }
+        return found.distinctBy { it.uri }
+    }
+
+    /** Replaces stale SAF rows with the freshly walked ones, keeping MediaStore entries as-is. */
+    private fun mergeSaf(
+        videos: List<MediaItemInfo>,
+        saf: List<MediaItemInfo>,
+    ): List<MediaItemInfo> {
+        if (saf.isEmpty()) return videos
+        val kept = videos.filterNot { MediaIndex.isSafEntry(it.id) }
+        return (kept + saf).distinctBy { it.uri }
+    }
+
+    /**
+     * Adds a single picked video to the library, so it shows up in "all videos" and in a folder —
+     * previously it was only played, which meant it never left the "recently played" tab.
+     */
+    fun importPickedVideo(uri: Uri, name: String?): MediaItemInfo {
+        val item = mediaFromPickedUri(uri, name)
+        viewModelScope.launch {
+            repository.cacheLocalVideos(listOf(item))
+            applyVideos((allVideos + item).distinctBy { it.uri }, loading = false)
+        }
+        return item
+    }
+
     fun mediaFromPickedUri(uri: Uri, name: String?): MediaItemInfo {
+        val meta = documentMetadata(uri)
+        val display = name ?: meta?.first?.takeIf { it.isNotBlank() }
+            ?: uri.lastPathSegment
+            ?: "video"
         return MediaItemInfo(
             id = "picked_${uri.hashCode()}",
-            name = name ?: uri.lastPathSegment ?: "video",
+            name = display,
             uri = uri.toString(),
-            sourceType = com.neko.video.model.SourceType.LOCAL,
+            // Synthetic parent path: without one `loadFolders` skips the entry, so the video would
+            // never appear in the folder tab.
+            path = "$MANUAL_FOLDER_PATH/$display",
+            sourceType = SourceType.LOCAL,
+            size = meta?.second ?: 0L,
+            modifiedTime = meta?.third ?: 0L,
             thumbnailUri = uri.toString(),
         )
     }
+
+    /** Display name, size and modified time of a SAF document; null when it cannot be read. */
+    private fun documentMetadata(uri: Uri): Triple<String, Long, Long>? = runCatching {
+        contentResolver.query(
+            uri,
+            arrayOf(
+                OpenableColumns.DISPLAY_NAME,
+                OpenableColumns.SIZE,
+                DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+            ),
+            null,
+            null,
+            null,
+        )?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                Triple(cursor.getString(0) ?: "", cursor.getLong(1), cursor.getLong(2))
+            } else {
+                null
+            }
+        }
+    }.getOrNull()
 
     /**
      * Recomputes the visible lists from the raw scan plus the current folder and sort choice.
@@ -393,4 +534,12 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
 
     private fun <T> applyOrder(comparator: Comparator<T>, items: List<T>): List<T> =
         if (sort.ascending) items.sortedWith(comparator) else items.sortedWith(comparator.reversed())
+
+    private companion object {
+        /** Pseudo folder that holds single videos added through the picker. */
+        const val MANUAL_FOLDER_PATH = "Manual"
+
+        /** MediaStore emits a burst of changes per copied file; wait for it to settle. */
+        const val MEDIA_OBSERVER_DEBOUNCE_MS = 1_500L
+    }
 }
